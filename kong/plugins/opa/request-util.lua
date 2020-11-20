@@ -1,0 +1,22 @@
+local ERR = ngx.ERR
+
+local function read_request_body()
+  ngx.req.read_body()
+  local body = ngx.req.get_body_data()
+
+  if not body then
+    -- see if body was buffered to tmp file, payload could have exceeded client_body_buffer_size
+    local body_filepath = ngx.req.get_body_file()
+    if body_filepath then
+      local file = io.open(body_filepath, "rb")
+      body = file:read("*all")
+      file:close()
+    end
+  end
+
+  return body
+end
+
+return {
+    read_request_body = read_request_body
+}

@@ -1,9 +1,16 @@
-local BasePlugin = require "kong.plugins.base_plugin"
-local responses = require "kong.tools.responses"
-local utils = require "kong.tools.utils"
 local http = require "resty.http"
 local cjson = require "cjson.safe"
-local public_utils = require "kong.tools.public"
+local request_util = require "kong.plugins.opa.request-util"
+
+-- Priority places this after Authentication and just after Rate Limiting plugins, see:
+-- https://docs.konghq.com/0.13.x/plugin-development/custom-logic/#plugins-execution-order
+local opa = {
+  PRIORITY = 899,
+  VERSION = "0.2.0"
+}
+
+local ngx_encode_base64    = ngx.encode_base64
+local kong                 = kong
 
 -- functions
 local new_tab
@@ -15,16 +22,16 @@ do
   end
 end
 
-function slice(list, from, to)
-  sliced_results = {};
+local function slice(list, from, to)
+  local sliced_results = {};
   for i=from, to do
     table.insert(sliced_results, list[i]);
   end;
   return sliced_results;
 end
 
-function split(s, delimiter)
-  result = {};
+local function split(s, delimiter)
+  local result = {};
   for match in (s..delimiter):gmatch("(.-)"..delimiter) do
       table.insert(result, match);
   end
@@ -34,16 +41,8 @@ end
 -- defaults
 local DEFAULT_PORT = 80
 
-local OPAHandler = BasePlugin:extend()
-
-function OPAHandler:new()
-  OPAHandler.super.new(self, "opa")
-end
-
-function OPAHandler:access(conf)
+function opa:access(conf)
   local start_time = ngx.now()
-  OPAHandler.super.access(self)
-
   local opa_input = new_tab(0, 6)
 
   -- forwarding various additional data based on config
@@ -62,7 +61,7 @@ function OPAHandler:access(conf)
     end
 
     if conf.forward_upstream_split_path then
-      raw_split_uri = split(var.upstream_uri, "/")
+      local raw_split_uri = split(var.upstream_uri, "/")
       opa_input.path = slice(raw_split_uri, 2, #raw_split_uri)
     end
 
@@ -72,17 +71,20 @@ function OPAHandler:access(conf)
     end
 
     if conf.forward_request_body then
-      ngx.req.read_body()
-
-      local body_args, err_code, body_raw = public_utils.get_body_info()
-      if err_code == public_utils.req_body_errors.unknown_ct then
-        -- don't know what this body MIME type is, base64 it just in case
-        body_raw = ngx.encode_base64(body_raw)
-        opa_input.body_base64 = true
+      local content_type = kong.request.get_header("content-type")
+      local body_raw = request_util.read_request_body()
+      local body_args, err = kong.request.get_body()
+      if err and err:match("content type") then
+        body_args = {}
+        if content_type ~= "application/json" then
+          -- don't know what this body MIME type is, base64 it just in case
+          body_raw = ngx_encode_base64(body_raw)
+          opa_input.body_base64 = true
+        end
       end
 
-      opa_input.body      = body_raw
-      opa_input.body_args = body_args
+      opa_input.request_body      = body_raw
+      opa_input.request_body_args = body_args
     end
 
   end
@@ -117,7 +119,7 @@ function OPAHandler:access(conf)
     }
   }
   if not res then
-    return responses.send_HTTP_INTERNAL_SERVER_ERROR(err)
+    return kong.response.exit(500, { message = "OPA server unreachable." })
   end
 
   local body = res:read_body()
@@ -125,7 +127,7 @@ function OPAHandler:access(conf)
 
   local ok, err = client:set_keepalive(conf.keepalive)
   if not ok then
-    return responses.send_HTTP_INTERNAL_SERVER_ERROR(err)
+    return kong.response.exit(500, { message = "Error communicating with the OPA server." })
   end
 
   -- set latency header
@@ -135,7 +137,7 @@ function OPAHandler:access(conf)
   then
     if not string.find(body, "true")
     then
-      return responses.send_HTTP_UNAUTHORIZED()
+      return kong.response.exit(401, { message = "Unauthorized" })
     end
     -- else continue the request
   else
@@ -146,9 +148,5 @@ function OPAHandler:access(conf)
 
 end
 
--- Priority places this after Authentication and just after Rate Limiting plugins, see:
--- https://docs.konghq.com/0.13.x/plugin-development/custom-logic/#plugins-execution-order
-OPAHandler.PRIORITY = 899
-OPAHandler.VERSION = "0.1.0"
 
-return OPAHandler
+return opa
